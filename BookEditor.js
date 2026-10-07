@@ -1,5 +1,8 @@
 /*  Wikisource → Wikidata book editor
  *  ------------------------------------------------------------------
+ *  Written and maintained by User:Jameela P. as part of the
+ *  Wiki Librarians Network.
+ *  ------------------------------------------------------------------
  *  A userscript for www.wikidata.org. Load a CSV/TSV export of
  *  ml.wikisource index pages, then walk through it row by row:
  *  find (or create) the edition item, compare each statement with the
@@ -22,7 +25,7 @@
   /* ------------------------------------------------------------------ */
 
   const WS_BASE = 'https://ml.wikisource.org/wiki/';
-  const SUMMARY = 'Book data from Wikisource via Wikisource → Wikidata book editor (#mlwsBookEditor)';
+  const SUMMARY = 'Book data from Malayalam Wikisource via Wikisource → Wikidata book editor (#mlwsBookEditor)';
   const LS_SESSION = 'mlwsBE.session.v1';
   const LS_CACHE = 'mlwsBE.entityCache.v1';
   const Q_EDITION = 'Q3331189';
@@ -33,6 +36,7 @@
   const FIELDS = [
     { key: 'qid', label: 'Existing QID column', helper: true, guess: ['wikidata_id', 'qid', 'item'] },
     { key: 'titleUrl', label: 'Work page URL (finds sitelinked item)', helper: true, guess: ['book_title_url'] },
+    { key: 'titleRaw', label: 'Title wikitext – [[link]] becomes the mlwikisource sitelink', helper: true, guess: ['book_title_raw'] },
     { key: 'authorUrl', label: 'Author page URL (finds sitelinked author)', helper: true, guess: ['author_url'] },
     { key: 'cover', label: 'Cover thumbnail URL', helper: true, guess: ['cover_thumbnail_url'] },
     { key: 'fileFallback', label: 'File URL (fallback / local-file check)', helper: true, guess: ['source_file_url'] },
@@ -111,6 +115,12 @@
     const col = S.map[key];
     return col && row ? String(row[col] == null ? '' : row[col]).trim() : '';
   }
+  // "[[കേരളോല്പത്തി|KERALOLPATTI …]]" → "കേരളോല്പത്തി"; plain text → null
+  function wikilinkTarget(raw) {
+    const m = /\[\[\s*:?\s*([^\]|#]+?)\s*(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]/.exec(raw || '');
+    return m ? m[1].replace(/_/g, ' ').replace(/\s+/g, ' ').trim() : null;
+  }
+  const normPage = t => String(t || '').replace(/_/g, ' ').trim().replace(/^./, c => c.toUpperCase());
   function wsTitleFromUrl(u) {
     const m = /^https?:\/\/ml\.wikisource\.org\/wiki\/([^?#]+)/.exec(u || '');
     return m ? safeDecode(m[1]).replace(/_/g, ' ') : null;
@@ -305,6 +315,11 @@
       { prop: 'P31', label: 'instance of', type: 'item', csv: '(always)', qid: Q_EDITION, fixed: true },
       { prop: 'P407', label: 'language of work or name', type: 'item', csv: '(always)', qid: Q_MALAYALAM, fixed: true },
     ];
+    const rawTitle = cellOf(row, 'titleRaw');
+    const linkPage = wikilinkTarget(rawTitle);
+    if (linkPage) {
+      out.push({ prop: 'mlwikisource', label: 'sitelink (Malayalam Wikisource)', type: 'sitelink', csv: rawTitle, page: linkPage, note: 'checking Wikisource…' });
+    }
     for (const f of FIELDS) {
       if (f.helper) continue;
       const raw = cellOf(row, f.key);
@@ -398,8 +413,19 @@
     const cl = (S.cur.entity && S.cur.entity.claims[prop]) || [];
     return cl.map(c => ({ snaktype: c.mainsnak.snaktype, v: c.mainsnak.snaktype === 'value' ? c.mainsnak.datavalue.value : null }));
   }
+  function currentSitelink() {
+    const e = S.cur.entity, sl = e && e.sitelinks && e.sitelinks.mlwikisource;
+    return sl ? sl.title : '';
+  }
   function statusOf(st) {
     if (st.unknown) return 'unknown';
+    if (st.type === 'sitelink') {
+      if (!st.page || st.blocked) return 'nodata';
+      if (!S.cur.entity) return 'ready';
+      const now = currentSitelink();
+      if (!now) return 'missing';
+      return normPage(now) === normPage(st.page) ? 'match' : 'differs';
+    }
     const v = valueOf(st);
     if (v == null) return st.part ? 'unresolved' : 'nodata';
     if (!S.cur.entity) return 'ready';
@@ -431,8 +457,8 @@
     const q = cellOf(row, 'qid').toUpperCase();
     if (/^Q\d+$/.test(q)) add(q, 'CSV QID');
 
-    const wt = wsTitleFromUrl(cellOf(row, 'titleUrl'));
-    if (wt) jobs.push(bySitelink('mlwikisource', wt).then(id => add(id, 'Wikisource sitelink')));
+    const wts = new Set([wsTitleFromUrl(cellOf(row, 'titleUrl')), wikilinkTarget(cellOf(row, 'titleRaw'))].filter(Boolean));
+    wts.forEach(wt => jobs.push(bySitelink('mlwikisource', wt).then(id => add(id, 'Wikisource sitelink'))));
 
     if (cur.indexUrl) {
       new Set([cur.indexUrl, cur.indexUrl.replace(/_/g, ' '), encodeURI(cur.indexUrl)]).forEach(v =>
@@ -497,6 +523,37 @@
     }
   }
 
+  let wsApi;
+  async function resolveSitelink(cur) {
+    const st = cur.stmts.find(s => s.type === 'sitelink');
+    if (!st) return;
+    wsApi = wsApi || new mw.ForeignApi('https://ml.wikisource.org/w/api.php', { anonymous: true });
+    const page = await new Promise(resolve => {
+      wsApi.get({ action: 'query', titles: st.page, redirects: 1, formatversion: 2 }).then(r => {
+        const p = r.query && r.query.pages && r.query.pages[0];
+        resolve(!p || p.missing || p.invalid ? null : p.title);
+      }, () => resolve(undefined));
+    });
+    if (page === null) { st.blocked = true; st.note = `"${st.page}" does not exist on ml.wikisource`; return; }
+    if (page === undefined) st.note = 'Could not reach Wikisource – page not verified';
+    else { st.note = page !== st.page ? `Wikisource redirect → ${page}` : 'Page exists on ml.wikisource'; st.page = page; }
+    const owner = await bySitelink('mlwikisource', st.page).catch(() => null);
+    st.owner = owner || null;
+  }
+
+  async function setSitelink(cur, st) {
+    if (!cur.entity || !st.page) return;
+    if (st.owner && st.owner !== cur.entity.id) {
+      throw new Error(`"${st.page}" is already linked from ${st.owner}. Remove it there first (or merge the items).`);
+    }
+    const id = cur.entity.id;
+    const r = await post({ action: 'wbsetsitelink', id, linksite: 'mlwikisource', linktitle: st.page });
+    const sl = r.entity && r.entity.sitelinks && r.entity.sitelinks.mlwikisource;
+    cur.entity.sitelinks.mlwikisource = sl || { site: 'mlwikisource', title: st.page };
+    st.owner = id;
+    log(`${id}: Added link to [mlwikisource]: ${cur.entity.sitelinks.mlwikisource.title}`, r.entity && r.entity.lastrevid);
+  }
+
   async function resolveParts(cur) {
     const parts = cur.stmts.filter(s => s.part);
     const authorTitle = wsTitleFromUrl(cellOf(cur.row, 'authorUrl'));
@@ -531,10 +588,11 @@
   }
 
   async function loadEntity(cur, id) {
-    const ents = await getEntities([id], 'labels|descriptions|claims');
+    const ents = await getEntities([id], 'labels|descriptions|claims|sitelinks');
     const e = Object.values(ents).find(x => x && x.id);
     if (!e || 'missing' in e) throw new Error(`${id} does not exist`);
     if (!e.claims || Array.isArray(e.claims)) e.claims = {};
+    if (!e.sitelinks || Array.isArray(e.sitelinks)) e.sitelinks = {};
     cur.entity = e;
     cur.row._qid = e.id;
     labels[e.id] = { label: pickLang(e.labels) || e.id, desc: pickLang(e.descriptions) };
@@ -549,6 +607,7 @@
   /* ------------------------------------------------------------------ */
 
   async function addStatement(cur, st) {
+    if (st.type === 'sitelink') return setSitelink(cur, st);
     const v = valueOf(st);
     if (!v || !cur.entity) return;
     const id = cur.entity.id;
@@ -613,7 +672,7 @@
       },
     };
     showMsg(''); renderRow();
-    const results = await Promise.allSettled([resolveFile(cur), resolveParts(cur), resolveBook(cur)]);
+    const results = await Promise.allSettled([resolveFile(cur), resolveSitelink(cur), resolveParts(cur), resolveBook(cur)]);
     if (token !== loadToken) return;
     const err = results.find(r => r.status === 'rejected');
     if (err) showMsg(err.reason.message, 'error');
@@ -666,6 +725,7 @@
   /* Rendering                                                           */
   /* ------------------------------------------------------------------ */
 
+  const wsLink = t => h('a', { href: WS_BASE + encodeURIComponent(String(t).replace(/ /g, '_')), target: '_blank' }, t);
   const propLink = p => h('a', { href: '/wiki/Property:' + p, target: '_blank' }, p);
   function qLink(id) {
     const l = labelOf(id);
@@ -852,21 +912,25 @@
 
   function renderStmt(st) {
     const cur = S.cur, status = statusOf(st);
-    const ex = cur.entity ? existing(st.prop) : [];
-    const exCell = cur.entity
-      ? (ex.length ? ex.map(e => h('div', null, e.v ? fmtValue(st.type, e.v) : (e.snaktype === 'somevalue' ? 'unknown value' : 'no value')))
-        : h('span', { class: 'wsbe-muted' }, 'none'))
-      : '';
+    const ex = cur.entity && st.type !== 'sitelink' ? existing(st.prop) : [];
+    const exCell = !cur.entity ? '' : st.type === 'sitelink'
+      ? (currentSitelink() ? wsLink(currentSitelink()) : h('span', { class: 'wsbe-muted' }, 'none'))
+      : (ex.length ? ex.map(e => h('div', null, e.v ? fmtValue(st.type, e.v) : (e.snaktype === 'somevalue' ? 'unknown value' : 'no value')))
+        : h('span', { class: 'wsbe-muted' }, 'none'));
     let action = null;
     if (['missing', 'differs', 'ready'].includes(status)) {
       action = h('button', {
         class: 'wsbe-btn' + (status === 'missing' ? ' wsbe-primary' : ''),
         disabled: !cur.entity || cur.busy, title: cur.entity ? '' : 'Choose or create the book item first',
-        onclick: () => doAdd(st),
-      }, status === 'differs' ? 'Add as extra value' : 'Add');
+        onclick: () => {
+          if (st.type === 'sitelink' && status === 'differs' &&
+            !confirm(`Replace the existing link "${currentSitelink()}" with "${st.page}"?`)) return;
+          doAdd(st);
+        },
+      }, st.type === 'sitelink' ? (status === 'differs' ? 'Replace link' : 'Add link') : status === 'differs' ? 'Add as extra value' : 'Add');
     }
     return h('tr', { class: 'wsbe-st-' + status },
-      h('td', null, propLink(st.prop), h('div', { class: 'wsbe-muted' }, st.label)),
+      h('td', null, st.type === 'sitelink' ? h('span', null, 'mlwikisource') : propLink(st.prop), h('div', { class: 'wsbe-muted' }, st.label)),
       h('td', null, renderInput(st)),
       h('td', null, exCell),
       h('td', null, badge(status), h('div', null, action)));
@@ -878,6 +942,12 @@
     if (st.fixed) return h('div', null, qLink(st.qid));
     if (st.unknown) return h('div', null, st.csv);
     switch (st.type) {
+      case 'sitelink':
+        return h('div', null,
+          h('input', { type: 'text', class: 'wsbe-wide', value: st.page, onchange: e => { st.page = e.target.value.trim(); st.blocked = false; st.owner = null; st.note = 'edited by hand – not verified'; rerender(); } }),
+          h('div', null, wsLink(st.page)), note,
+          st.owner && (!S.cur.entity || st.owner !== S.cur.entity.id)
+            ? h('div', { class: 'wsbe-msg wsbe-msg-warn' }, 'Already linked from ', qLink(st.owner)) : null);
       case 'url':
         return h('div', null, h('input', { type: 'text', class: 'wsbe-wide', value: st.value || '', onchange: e => { st.value = normUrl(e.target.value); rerender(); } }), note);
       case 'mono':
@@ -1042,7 +1112,10 @@
       h('div', { class: 'wsbe-card wsbe-nav', id: 'wsbe-nav', hidden: true }),
       h('div', { id: 'wsbe-msg' }),
       h('div', { id: 'wsbe-row' }),
-      h('details', { class: 'wsbe-card', open: true }, h('summary', null, 'Edits made in this session'), h('ol', { id: 'wsbe-logl' })));
+      h('details', { class: 'wsbe-card', open: true }, h('summary', null, 'Edits made in this session'), h('ol', { id: 'wsbe-logl' })),
+      h('p', { class: 'wsbe-muted' }, 'Script written and maintained by ',
+        h('a', { href: '/wiki/User:Jameela_P.', target: '_blank' }, 'User:Jameela P.'),
+        ' as part of the Wiki Librarians Network.'));
   }
 
   function init() {
